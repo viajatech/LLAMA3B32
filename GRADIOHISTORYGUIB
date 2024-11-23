@@ -1,0 +1,209 @@
+#pip install torch torchvision torchaudio transformers accelerate bitsandbytes gradio
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, StoppingCriteria, StoppingCriteriaList
+import gradio as gr
+import torch
+
+# Tu token de Hugging Face
+HF_TOKEN = "tu_token_aquí"  # Reemplaza con tu token de Hugging Face
+
+# Configuración global para el modelo y tokenizador
+model = None
+tokenizer = None
+
+# Configuración personalizada por defecto
+default_user_name = "David"
+default_chatbot_name = "Isabella"
+default_response_word_limit = 50
+default_story_context = ""
+
+def load_model():
+    """
+    Carga el modelo LLaMA 3.2-3B con optimización de memoria en modo 8-bit.
+    """
+    global model, tokenizer
+    llama_model_name = "meta-llama/Llama-3.2-3B"
+    print("Cargando el tokenizador...")
+
+    # Cargar el tokenizador con autenticación
+    tokenizer = AutoTokenizer.from_pretrained(
+        llama_model_name,
+        token=HF_TOKEN
+    )
+
+    print("Cargando el modelo...")
+    # Configuración de BitsAndBytes para optimización en 8-bit
+    bnb_config = BitsAndBytesConfig(
+        load_in_8bit=True  # Carga el modelo en 8-bit para reducir uso de memoria
+    )
+
+    # Cargar el modelo con autenticación
+    model = AutoModelForCausalLM.from_pretrained(
+        llama_model_name,
+        quantization_config=bnb_config,
+        device_map="auto" if torch.cuda.is_available() else "cpu",
+        token=HF_TOKEN
+    )
+
+    print("Modelo cargado exitosamente.")
+
+class StopOnToken(StoppingCriteria):
+    def __init__(self, tokenizer, stop_token):
+        self.stop_token_id = tokenizer.encode(stop_token, add_special_tokens=False)
+
+    def __call__(self, input_ids, scores, **kwargs):
+        # Verifica si los últimos tokens generados coinciden con el token de parada
+        if len(input_ids[0]) >= len(self.stop_token_id):
+            if (input_ids[0][-len(self.stop_token_id):] == torch.tensor(self.stop_token_id).to(input_ids.device)).all():
+                return True
+        return False
+
+def generate_text(user_input, state):
+    """
+    Genera texto basado en el historial de conversación y la entrada del usuario.
+    """
+    if model is None or tokenizer is None:
+        raise ValueError("El modelo no está cargado. Llama a load_model() primero.")
+
+    # Desempaquetar variables de estado
+    history = state['history']
+    story_context = state['story_context']
+    response_word_limit = state['response_word_limit']
+    user_name = state['user_name']
+    chatbot_name = state['chatbot_name']
+
+    # Actualizar el historial de conversación con la entrada del usuario
+    history.append((f"{user_name}", f"{user_input}"))
+
+    # Construir el prompt con tokens especiales
+    prompt = f"{story_context}\n"
+    for (sender, message) in history:
+        if sender == user_name:
+            prompt += f"<|user|>{message}<|endofuser|>\n"
+        else:
+            prompt += f"<|bot|>{message}<|endofbot|>\n"
+    prompt += f"<|bot|>"
+
+    # Definir tokens de inicio y fin
+    stop_token = "<|endofbot|>"
+
+    # Generar la respuesta del modelo
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
+
+    stopping_criteria = StoppingCriteriaList([StopOnToken(tokenizer, stop_token)])
+
+    outputs = model.generate(
+        inputs["input_ids"],
+        max_new_tokens=200,
+        temperature=0.7,
+        top_p=0.9,
+        repetition_penalty=1.1,
+        pad_token_id=tokenizer.eos_token_id,
+        do_sample=True,
+        stopping_criteria=stopping_criteria
+    )
+
+    response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
+
+    # Extraer la respuesta del modelo hasta el token de parada
+    response = response.split("<|endofbot|>")[0].strip()
+
+    # Limitar la respuesta a la cantidad máxima de palabras
+    if response_word_limit > 0:
+        response = " ".join(response.split()[:response_word_limit])
+
+    # Actualizar el historial con la respuesta del modelo
+    history.append((f"{chatbot_name}", f"{response}"))
+
+    # Actualizar el estado
+    state['history'] = history
+
+    return state
+
+def chat_interface(user_input, new_user_name, new_chatbot_name, new_story_context, new_word_limit, reset, state):
+    """
+    Interfaz para interactuar con el modelo desde Gradio.
+    """
+    # Inicializar el estado si es None
+    if state is None:
+        state = {
+            'history': [],
+            'user_name': default_user_name,
+            'chatbot_name': default_chatbot_name,
+            'story_context': default_story_context,
+            'response_word_limit': default_response_word_limit
+        }
+
+    if reset:
+        # Reiniciar el historial de conversación
+        state['history'] = []
+        # Actualizar configuraciones si se proporcionan
+        state['user_name'] = new_user_name or default_user_name
+        state['chatbot_name'] = new_chatbot_name or default_chatbot_name
+        state['story_context'] = new_story_context or default_story_context
+        state['response_word_limit'] = int(new_word_limit) if new_word_limit else default_response_word_limit
+        # No añadir mensaje inicial
+        return state['history'], state
+    else:
+        # Verificar si las configuraciones han cambiado
+        settings_changed = False
+        if new_user_name and new_user_name != state['user_name']:
+            state['user_name'] = new_user_name
+            settings_changed = True
+        if new_chatbot_name and new_chatbot_name != state['chatbot_name']:
+            state['chatbot_name'] = new_chatbot_name
+            settings_changed = True
+        if new_story_context and new_story_context != state['story_context']:
+            state['story_context'] = new_story_context
+            settings_changed = True
+        if new_word_limit and int(new_word_limit) != state['response_word_limit']:
+            state['response_word_limit'] = int(new_word_limit)
+            settings_changed = True
+
+        if settings_changed and not user_input:
+            # Si las configuraciones han cambiado pero no hay entrada del usuario, no generar respuesta
+            return state['history'], state
+
+        if not user_input:
+            # Si no hay entrada del usuario, devolver el historial actual
+            return state['history'], state
+
+        # Generar respuesta
+        state = generate_text(user_input, state)
+        return state['history'], state
+
+def main():
+    """
+    Configura el modelo y lanza la interfaz interactiva con Gradio.
+    """
+    print("Cargando el modelo...")
+    load_model()
+
+    print("Iniciando la interfaz...")
+    interface = gr.Interface(
+        fn=chat_interface,
+        inputs=[
+            gr.Textbox(label="Entrada del Usuario", placeholder="Escribe aquí tu mensaje", lines=2),
+            gr.Textbox(label="Nombre del Usuario (opcional)", placeholder="Tu nombre"),
+            gr.Textbox(label="Nombre del Chatbot (opcional)", placeholder="Nombre del chatbot"),
+            gr.Textbox(label="Historia o Contexto Inicial (opcional)", placeholder="Escribe aquí una historia o contexto", lines=4),
+            gr.Slider(label="Palabras Máximas en Respuesta", minimum=10, maximum=200, step=10, value=50),
+            gr.Checkbox(label="Reiniciar Conversación", value=False),
+            gr.State()  # Estado
+        ],
+        outputs=[
+            gr.Chatbot(label="Historial de la Conversación", type="tuples"),
+            gr.State()  # Estado
+        ],
+        title="Chatbot Gradio by Viaja Tech",
+        description=(
+            "Interactúa con el modelo LLaMA 3.2-3B localmente. Personaliza nombres, contexto inicial y límite de palabras. "
+            "Presiona Enter para enviar tu mensaje y continuar la conversación."
+        ),
+        live=False
+    )
+
+    interface.launch(share=True)
+
+if __name__ == "__main__":
+    main()
